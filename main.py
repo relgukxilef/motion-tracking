@@ -6,17 +6,17 @@ import numpy
 import quaternion
 import matplotlib.pyplot
 
-file = "../Datasets/Mixamo/Catwalk Walk.glb"
+file = "../Datasets/Mixamo/Walking.glb"
 
 bones = [
-    "Hips", "RightUpLeg", "RightLeg", "LeftUpLeg", "LeftLeg", "Spine2", "Head",
-    "RightHand", "LeftHand"
+    "RightUpLeg", "RightLeg", "LeftUpLeg", "LeftLeg", "Spine2", 
+    "Head", "RightHand", "LeftHand"
 ]
 
-# Create a list of tensors of shape (time, bone, translation and orientation,)
-
-# relative[animation][node, time]
-# needs to contain every node to apply parent transformation
+def rotate(q, v):
+    return quaternion.as_vector_part(
+        q * quaternion.from_vector_part(v) * q.conj()
+    )
 
 class transformation:
     def from_shape(shape):
@@ -40,11 +40,7 @@ class transformation:
             quaternion.as_quat_array(t.rotation) for t in (self, other)
         )
         return transformation(
-            self.translation + 
-            quaternion.as_vector_part(
-                quat * quaternion.from_vector_part(other.translation) * 
-                quat.conj()
-            ),
+            self.translation + rotate(quat, other.translation),
             quaternion.as_float_array(quat * other_quat)
         )
 
@@ -89,13 +85,6 @@ def load(file):
 
     stack = []
     for node_index in gltf.scenes[gltf.scene].nodes:
-        #world_transform = (
-        #    base.apply(lambda a: a[None, node_index, :]) * 
-        #    transforms.apply(lambda a: a[:, node_index, :])
-        #)
-        #def apply(a, w):
-        #    a[:, node_index, :] = w
-        #transforms.apply(apply, world_transform)
         stack.append(node_index)
 
     while stack != []:
@@ -103,7 +92,6 @@ def load(file):
         node = gltf.nodes[node_index]
         for child_index in node.children:
             world_transform = (
-                #base.apply(lambda a: a[None, child_index, :]) * 
                 transforms.apply(lambda a: a[:, node_index, :]) * 
                 transforms.apply(lambda a: a[:, child_index, :])
             )
@@ -112,17 +100,75 @@ def load(file):
             transforms.apply(apply, world_transform)
             stack.append(child_index)
 
-    return transforms.apply(lambda v: v[::10, :, :])
-    return transforms
+    selected = transformation.from_shape([steps, len(bones)])
+    for node_index, node in enumerate(gltf.nodes):
+        name = node.name[len("mixamorig:"):]
+        try:
+            index = bones.index(name)
+        except ValueError:
+            continue
+        def apply(a, v):
+            a[:, index, :] = v[:, node_index, :]
+        selected.apply(apply, transforms)
 
-t = load(file).translation
+    return selected
 
-f = matplotlib.pyplot.figure()
-p = f.add_subplot(111, projection="3d")
-p.scatter(
-    t[..., 0].flatten(), -t[..., 2].flatten(), t[..., 1].flatten()
+def scatter(t):
+    f = matplotlib.pyplot.figure()
+    p = f.add_subplot(111, projection="3d")
+    p.scatter(
+        t[..., 0].flatten(), -t[..., 2].flatten(), t[..., 1].flatten()
+    )
+    s = 2
+    p.set_xlim(-s, s)
+    p.set_ylim(-s, s)
+    p.set_zlim(-s, s)
+    matplotlib.pyplot.show()
+
+def simulate_sensors(transforms, sensor_offsets, north):
+    sensor_bones = [
+        "RightUpLeg", "RightLeg", "LeftUpLeg", "LeftLeg", "Spine2"
+    ]
+    sensors = transforms.apply(lambda a: a[:, :5, :])
+    quats = quaternion.as_quat_array(sensors.rotation)
+    anuglar_velocity = numpy.stack(
+        [
+            quaternion.quaternion_time_series.angular_velocity(
+                q, numpy.arange(0, len(q) / 60, 1 / 60)
+            )[1:-1, ...]
+            for q in quats.transpose()
+        ], -1
+    )
+    sensors = sensors * sensor_offsets
+    velocity = (
+        sensors.translation[..., 1:, :, :] - 
+        sensors.translation[..., :-1, :, :]
+    ) * 60
+    acceleration = (velocity[..., 1:, :, :] - velocity[..., :-1, :, :]) * 60
+    inverse = numpy.invert(quats[..., 1:-1, :])
+    acceleration = rotate(inverse, acceleration)
+    heading = rotate(inverse, north)
+
+    return sensors, anuglar_velocity, acceleration, heading
+
+def random_cylinder(batch_size):
+    translation = numpy.random.uniform(
+        [0, 0, .1], [0, 0.4, 0.1], (batch_size, 1, 5, 3)
+    )
+    rotation = numpy.random.uniform(
+        [0, 0, 0], [0, 2 * numpy.pi, 0], (batch_size, 1, 5, 3)
+    )
+    quat = quaternion.from_rotation_vector(rotation)
+    translation = rotate(quat, translation)
+    return transformation(translation, quaternion.as_float_array(quat))
+
+transforms = load(file)
+
+sensors, anuglar_velocity, acceleration, heading = simulate_sensors(
+    transforms, random_cylinder(32), [0, 0, 1]
 )
-p.set_xlim(-2, 2)
-p.set_ylim(-2, 2)
-p.set_zlim(-2, 2)
-matplotlib.pyplot.show()
+
+scatter(sensors.translation[..., 0, :, :])
+
+# TODO: fit a model
+# TODO: save model
