@@ -1,12 +1,14 @@
 
 import datetime, os
-#import tensorflow as tf
+import tensorflow as tf
 from pygltflib import GLTF2
 import numpy
 import quaternion
 import matplotlib.pyplot
+import glob
 
-file = "../Datasets/Mixamo/Walking.glb"
+pattern = "../Datasets/Mixamo/*.glb"
+files = glob.glob(pattern)
 
 bones = [
     "RightUpLeg", "RightLeg", "LeftUpLeg", "LeftLeg", "Spine2", 
@@ -63,11 +65,11 @@ def load(file):
         base.translation[i] = node.translation
         base.rotation[i] = node.rotation[3:] + node.rotation[:3]
 
-    steps = gltf.accessors[0].count
+    animation = gltf.animations[-1]
+    steps = gltf.accessors[animation.samplers[0].input].count
     transforms = base.apply(
         lambda a: numpy.tile(a, (steps, len(gltf.nodes), 1,))
     )
-    animation = gltf.animations[0]
 
     for channel in animation.channels:
         sampler = animation.samplers[channel.sampler]
@@ -130,16 +132,12 @@ def simulate_sensors(transforms, sensor_offsets, north):
         "RightUpLeg", "RightLeg", "LeftUpLeg", "LeftLeg", "Spine2"
     ]
     sensors = transforms.apply(lambda a: a[:, :5, :])
-    quats = quaternion.as_quat_array(sensors.rotation)
-    anuglar_velocity = numpy.stack(
-        [
-            quaternion.quaternion_time_series.angular_velocity(
-                q, numpy.arange(0, len(q) / 60, 1 / 60)
-            )[1:-1, ...]
-            for q in quats.transpose()
-        ], -1
-    )
     sensors = sensors * sensor_offsets
+    quats = quaternion.as_quat_array(sensors.rotation)
+    anuglar_velocity = numpy.moveaxis(numpy.apply_along_axis(
+        quaternion.quaternion_time_series.angular_velocity,
+        -2, quats, numpy.arange(0, quats.shape[-2]) / 60
+    )[..., 1:-1, :, :], -2, -1)
     velocity = (
         sensors.translation[..., 1:, :, :] - 
         sensors.translation[..., :-1, :, :]
@@ -151,24 +149,62 @@ def simulate_sensors(transforms, sensor_offsets, north):
 
     return sensors, anuglar_velocity, acceleration, heading
 
-def random_cylinder(batch_size):
+def random_cylinder(size):
     translation = numpy.random.uniform(
-        [0, 0, .1], [0, 0.4, 0.1], (batch_size, 1, 5, 3)
+        [0, 0, .1], [0, 0.4, 0.1], (size, 1, 5, 3)
     )
     rotation = numpy.random.uniform(
-        [0, 0, 0], [0, 2 * numpy.pi, 0], (batch_size, 1, 5, 3)
+        [0, 0, 0], [0, 2 * numpy.pi, 0], (size, 1, 5, 3)
     )
     quat = quaternion.from_rotation_vector(rotation)
     translation = rotate(quat, translation)
     return transformation(translation, quaternion.as_float_array(quat))
 
-transforms = load(file)
 
-sensors, anuglar_velocity, acceleration, heading = simulate_sensors(
-    transforms, random_cylinder(32), [0, 0, 1]
+sensor_offsets = random_cylinder(2)
+north = numpy.random.normal(size=(2, 1, 1, 3))
+
+datasets = []
+
+for file in files:
+    transforms = load(file)
+
+    sensors, anuglar_velocity, acceleration, heading = simulate_sensors(
+        transforms, sensor_offsets, north
+    )
+
+    values = (
+        (anuglar_velocity, acceleration, heading,),
+        (
+            sensors.translation[..., 1:-1, :, :], 
+            sensors.rotation[..., 1:-1, :, :],
+        ),
+    )
+
+    file_data = (
+        tf.data.Dataset.from_tensor_slices(values).
+        flat_map(
+            lambda *x: 
+            tf.data.Dataset.from_tensor_slices(x).
+            window(120, 1, 1, True).
+            flat_map(
+                lambda *w: 
+                tf.data.Dataset.zip(w).batch(120, True, tf.data.AUTOTUNE)
+            )
+        ).
+        shuffle(1000)
+    )
+    datasets.append(file_data)
+
+dataset = (
+    tf.data.Dataset.sample_from_datasets(datasets).shuffle(128).
+    batch(1, True, tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
 )
 
-scatter(sensors.translation[..., 0, :, :])
-
 # TODO: fit a model
+e = next(iter(dataset))
+print(e)
+
+# batch shape: [batch, time, node, 3 + 3 + 3]
+
 # TODO: save model
